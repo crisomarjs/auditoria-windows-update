@@ -16,11 +16,6 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ==============================================================================
-# REGIÓN: Inicialización y estructura de carpetas
-# ==============================================================================
-#region Init
-
 $BasePath   = "C:\PSWindowsUpdate"
 $ScriptPath = "$BasePath\Script"
 
@@ -30,24 +25,18 @@ foreach ($Path in @($BasePath, $LogDir, $ScriptPath)) {
     }
 }
 
-# Política de ejecución solo para esta sesión (no modifica el sistema)
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
-# Archivo de log con timestamp para no sobreescribir históricos
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile   = "$LogDir\WU_Audit_$($env:COMPUTERNAME)_$Timestamp.log"
 
-# Detectar versión del SO para ajustar el comportamiento del script
 $OS        = Get-CimInstance -ClassName Win32_OperatingSystem
 $OSCaption = $OS.Caption
 $OSBuild   = $OS.BuildNumber
 
-#endregion
-
 # ==============================================================================
-# REGIÓN: Funciones auxiliares
+# Funciones
 # ==============================================================================
-#region Functions
 
 function Write-Log {
     param (
@@ -78,57 +67,100 @@ function Get-OSVersion {
 }
 
 function Ensure-PSWindowsUpdate {
-    <#
-    .SYNOPSIS
-        Instala PSWindowsUpdate solo si no está disponible.
-        En 2012 R2, garantiza TLS 1.2 antes de descargar desde PSGallery.
-    #>
-
-    # En 2012 R2 (Build 9600) PowerShell 5.1 puede no estar presente de fábrica.
-    # Verificamos la versión mínima requerida por PSWindowsUpdate.
+    # Requiere PowerShell 5.1 minimo. En 2012 R2 instalar WMF 5.1: https://aka.ms/wmf51download
     if ($PSVersionTable.PSVersion.Major -lt 5) {
-        Write-Log "PowerShell 5.1 es requerido. Versión actual: $($PSVersionTable.PSVersion)" -Level ERROR
-        Write-Log "Instale WMF 5.1 desde: https://aka.ms/wmf51download" -Level ERROR
-        throw "Versión de PowerShell insuficiente."
+        Write-Log "PowerShell 5.1 es requerido. Version actual: $($PSVersionTable.PSVersion)" -Level ERROR
+        throw "Version de PowerShell insuficiente."
     }
 
     if (!(Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-        Write-Log "Módulo PSWindowsUpdate no encontrado. Instalando..." -Level WARN
+        Write-Log "Modulo PSWindowsUpdate no encontrado. Instalando..." -Level WARN
 
-        # Forzar TLS 1.2 (requerido por PSGallery, especialmente en 2012 R2)
         [Net.ServicePointManager]::SecurityProtocol = `
             [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
 
-        # Instalar NuGet si no existe
         if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false
         }
 
-        # Registrar PSGallery como fuente confiable si no lo es
         $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
         if ($gallery -and $gallery.InstallationPolicy -ne "Trusted") {
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
         }
 
         Install-Module PSWindowsUpdate -Force -Confirm:$false -SkipPublisherCheck -AllowClobber
-        Write-Log "Módulo PSWindowsUpdate instalado correctamente."
+        Write-Log "Modulo PSWindowsUpdate instalado correctamente."
     }
 
     Import-Module PSWindowsUpdate -Force
 }
 
-#endregion
+function Get-PendingRebootStatus {
+    <#
+        Revisa todas las ubicaciones del registro donde Windows indica
+        que hay un reinicio pendiente por actualizaciones u otros cambios.
+    #>
+    $Motivos   = [System.Collections.Generic.List[string]]::new()
+    $Pendiente = $false
+
+    # 1. Component Based Servicing - Windows Update aplico cambios que requieren reinicio
+    $CBS = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+    if (Test-Path "$CBS\RebootPending") {
+        $Motivos.Add("Windows Update - Component Based Servicing (RebootPending)")
+        $Pendiente = $true
+    }
+
+    # 2. Windows Update registro reinicio requerido explicitamente
+    $WU = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+    if (Test-Path "$WU\RebootRequired") {
+        $Motivos.Add("Windows Update - Auto Update (RebootRequired)")
+        $Pendiente = $true
+    }
+
+    # 3. Archivos en uso que seran reemplazados al reiniciar
+    $PFR    = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+    $PFRVal = Get-ItemProperty -Path $PFR -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($PFRVal -and $PFRVal.PendingFileRenameOperations) {
+        $Motivos.Add("Archivos pendientes de reemplazar al reiniciar (PendingFileRenameOperations)")
+        $Pendiente = $true
+    }
+
+    # 4. Instalacion de software (MSI) dejo reinicio pendiente
+    $SW = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
+    if (Test-Path $SW) {
+        $Motivos.Add("Instalacion de software en progreso (MSI InProgress)")
+        $Pendiente = $true
+    }
+
+    # 5. Servicios de Windows Update pendientes de registrar
+    $SvcPending = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Services\Pending"
+    if (Test-Path $SvcPending) {
+        $Motivos.Add("Servicios de Windows Update pendientes de registrar")
+        $Pendiente = $true
+    }
+
+    # 6. SCCM / ConfigMgr requiere reinicio
+    $SCCM = "HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client\Reboot Management\RebootData"
+    if (Test-Path $SCCM) {
+        $Motivos.Add("SCCM / Configuration Manager requiere reinicio")
+        $Pendiente = $true
+    }
+
+    return [PSCustomObject]@{
+        Pendiente = $Pendiente
+        Motivos   = $Motivos
+    }
+}
 
 # ==============================================================================
-# REGIÓN: Encabezado del log
+# Encabezado
 # ==============================================================================
-#region Header
 
 $OSLabel = Get-OSVersion
 
 @"
 =========================================================================
-  AUDITORÍA WINDOWS UPDATE - SOLO CONSULTA (NO INSTALA)
+  AUDITORIA WINDOWS UPDATE - SOLO CONSULTA (NO INSTALA)
 =========================================================================
   Servidor   : $($env:COMPUTERNAME)
   SO         : $OSLabel ($OSCaption)
@@ -141,17 +173,14 @@ $OSLabel = Get-OSVersion
 
 Write-Host ""
 Write-Host "==========================================================================" -ForegroundColor Cyan
-Write-Host "  AUDITORÍA WINDOWS UPDATE  |  $($env:COMPUTERNAME)  |  $OSLabel"           -ForegroundColor Cyan
+Write-Host "  AUDITORIA WINDOWS UPDATE  |  $($env:COMPUTERNAME)  |  $OSLabel" -ForegroundColor Cyan
 Write-Host "==========================================================================" -ForegroundColor Cyan
 
-#endregion
-
 # ==============================================================================
-# REGIÓN: Último KB instalado
+# Ultimo KB instalado
 # ==============================================================================
-#region LastPatch
 
-Write-Log "ÚLTIMO PARCHE (KB) INSTALADO" -Level SECTION
+Write-Log "ULTIMO PARCHE (KB) INSTALADO" -Level SECTION
 
 try {
     $AllHotfixes = Get-HotFix | Where-Object { $_.InstalledOn -ne $null } |
@@ -161,15 +190,13 @@ try {
         $Last = $AllHotfixes | Select-Object -First 1
         $Report = @"
 
-  KB          : $($Last.HotFixID)
-  Tipo        : $($Last.Description)
-  Instalado   : $($Last.InstalledOn.ToString("yyyy-MM-dd"))
+  KB           : $($Last.HotFixID)
+  Tipo         : $($Last.Description)
+  Instalado    : $($Last.InstalledOn.ToString("yyyy-MM-dd"))
   Instalado por: $($Last.InstalledBy)
 "@
         Write-Log $Report
-
-        # Mostrar los últimos 5 como referencia
-        Write-Log "`n  Últimos 5 parches instalados:" -Level INFO
+        Write-Log "`n  Ultimos 5 parches instalados:" -Level INFO
         $AllHotfixes | Select-Object -First 5 |
             Select-Object HotFixID, Description,
                 @{N="InstalledOn";E={$_.InstalledOn.ToString("yyyy-MM-dd")}},
@@ -179,19 +206,46 @@ try {
             Out-File -FilePath $LogFile -Append -Encoding UTF8
     }
     else {
-        Write-Log "No se encontraron parches registrados en Win32_QuickFixEngineering." -Level WARN
+        Write-Log "No se encontraron parches registrados." -Level WARN
     }
 }
 catch {
     Write-Log "Error al obtener historial de HotFix: $($_.Exception.Message)" -Level ERROR
 }
 
-#endregion
+# ==============================================================================
+# Estado de reinicio pendiente
+# ==============================================================================
+
+Write-Log "ESTADO DE REINICIO PENDIENTE" -Level SECTION
+
+try {
+    $RebootStatus = Get-PendingRebootStatus
+
+    if ($RebootStatus.Pendiente) {
+        Write-Log "  REINICIO PENDIENTE: SI" -Level WARN
+        Write-Log "  Motivo(s) detectado(s):" -Level WARN
+        foreach ($Motivo in $RebootStatus.Motivos) {
+            Write-Log "    - $Motivo" -Level WARN
+        }
+        Write-Log "  Al reiniciar el servidor se aplicaran los cambios pendientes." -Level WARN
+        Write-Host ""
+        Write-Host "  *** ESTE SERVIDOR REQUIERE REINICIO ***" -ForegroundColor Red
+    }
+    else {
+        Write-Log "  REINICIO PENDIENTE: NO" -Level INFO
+        Write-Log "  El servidor no requiere reinicio en este momento." -Level INFO
+        Write-Host ""
+        Write-Host "  Sin reinicio pendiente." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Log "Error al verificar estado de reinicio: $($_.Exception.Message)" -Level ERROR
+}
 
 # ==============================================================================
-# REGIÓN: KBs pendientes de seguridad (requiere PSWindowsUpdate)
+# Actualizaciones de seguridad pendientes
 # ==============================================================================
-#region PendingUpdates
 
 Write-Log "ACTUALIZACIONES PENDIENTES (SOLO LECTURA)" -Level SECTION
 
@@ -203,34 +257,32 @@ try {
     $AllUpdates = Get-WindowsUpdate -MicrosoftUpdate -ErrorAction Stop
 
     if ($AllUpdates) {
-        # Filtrar actualizaciones de seguridad, acumulativas y rollups
+        # @() garantiza array aunque Where-Object no encuentre coincidencias
         $SecurityUpdates = @($AllUpdates | Where-Object {
             $_.Title      -match "Security|Cumulative|Rollup" -or
             $_.Categories -match "Security Updates"
         })
 
-        # Todas las actualizaciones disponibles
         Write-Log "`n  Total de actualizaciones disponibles: $($AllUpdates.Count)" -Level INFO
         $AllUpdates |
             Select-Object KB, Size,
-                @{N="Título";E={$_.Title.Substring(0, [Math]::Min(70, $_.Title.Length))}} |
+                @{N="Titulo";E={$_.Title.Substring(0, [Math]::Min(70, $_.Title.Length))}} |
             Format-Table -AutoSize -Wrap |
             Out-String |
             Out-File -FilePath $LogFile -Append -Encoding UTF8
 
-        # Solo las de seguridad
         Write-Log "`n  Actualizaciones de SEGURIDAD pendientes: $($SecurityUpdates.Count)" -Level INFO
 
-        if ($SecurityUpdates) {
+        if ($SecurityUpdates.Count -gt 0) {
             $SecurityUpdates |
                 Select-Object KB, Size,
-                    @{N="Título";E={$_.Title.Substring(0, [Math]::Min(70, $_.Title.Length))}} |
+                    @{N="Titulo";E={$_.Title.Substring(0, [Math]::Min(70, $_.Title.Length))}} |
                 Format-Table -AutoSize -Wrap |
                 Out-String |
                 Out-File -FilePath $LogFile -Append -Encoding UTF8
 
             Write-Host ""
-            Write-Host "  HAY $($SecurityUpdates.Count) ACTUALIZACIÓN(ES) DE SEGURIDAD PENDIENTE(S)" `
+            Write-Host "  HAY $($SecurityUpdates.Count) ACTUALIZACION(ES) DE SEGURIDAD PENDIENTE(S)" `
                 -ForegroundColor Yellow
         }
         else {
@@ -239,21 +291,18 @@ try {
         }
     }
     else {
-        Write-Log "  El servidor está al día. No hay actualizaciones disponibles." -Level INFO
-        Write-Host "  Servidor al día." -ForegroundColor Green
+        Write-Log "  El servidor esta al dia. No hay actualizaciones disponibles." -Level INFO
+        Write-Host "  Servidor al dia." -ForegroundColor Green
     }
 }
 catch {
     Write-Log "Error al consultar Windows Update: $($_.Exception.Message)" -Level ERROR
-    Write-Log "Sugerencia: Verifique conectividad con el servidor WSUS o con Internet." -Level WARN
+    Write-Log "Verifique conectividad con WSUS o Internet." -Level WARN
 }
 
-#endregion
-
 # ==============================================================================
-# REGIÓN: Pie del log
+# Fin
 # ==============================================================================
-#region Footer
 
 @"
 
@@ -266,5 +315,3 @@ Write-Host ""
 Write-Host "  Log guardado en:" -ForegroundColor Cyan
 Write-Host "  $LogFile" -ForegroundColor Green
 Write-Host ""
-
-#endregion
